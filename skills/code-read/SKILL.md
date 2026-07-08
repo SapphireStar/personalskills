@@ -762,7 +762,23 @@ Step 1 — 按导览四层顺序读，不要跳层：
   第三层（运行时驱动）：每个函数 Read 全文，贴出完整代码 + 注解心跳机制
   第四层（按需深入）：只给函数索引表 + 职责简注，不贴全文（篇幅控制）
 
-Step 2 — 注解每个函数时，必须包含：
+Step 2 — 在精读过程中同步收集时序信息，产出核心时序图（紧跟模块职能总结后）：
+  - 精读第一/二/三层函数时，记录"谁调用谁、什么时机、跨进程边界在哪、file:line"
+  - 产出主时序图：覆盖模块主入口 → 核心数据流 → 输出（一张图讲清主干）
+  - 子图抽离判据（二选一触发）：主图参与者 >5 个，或 含跨进程子系统（DS↔GS / Client↔DS）
+    每张子图聚焦一个高内聚子系统（如 "RO Spawn 流程"、"GS↔DS RO 数据上行"、"EntityCallback 跨端转发"）
+    模块简单（≤5 参与者、无跨进程）时只画主图，不凑子图
+  - 时序图设计规范：
+    * autonumber 开头自动编号，便于和注解小节交叉引用
+    * participant 显式声明并起别名（如 `participant MAC as MutableActorComponent`），消息行用别名保持简短
+    * 跨进程用 box 分区，**rgb 三通道值均须 ≤100**（映射到 [0,100]，避免暗色模式下浅色背景导致文字看不清）。如 `box rgb(40,60,100) DS端` / `box rgb(100,60,40) GS端`——深色背景配浅色文字，明暗模式都可读
+    * 每条消息末尾标注 file:line（如 `MAC->>Sender: SendRequest(ChannelID, Request) (Server:730)`），读不到的调用关系不画
+    * alt/opt/loop 表达分支与循环（FastForwarding vs RemoteForwarding 用 alt，每帧 tick 用 loop）
+    * Note over 标注关键不变量（如 `Note over MAC,Sender: ProcessMessageSender 每帧驱动 (Server:1454)`）
+    * 主图聚焦主入口主干；持久化事件、任务回调等非主干流程进子图或第四层
+  - 严禁画读不到的调用关系：每条消息必须可追溯 file:line，精读时没看到的调用不画
+
+Step 3 — 注解每个函数时，必须包含：
   - 函数签名 + 行号（如 `Initialize`（行 37-70））
   - 原始代码片段（用 ```lua / ```cpp / ``` 包裹，保留原始缩进）
   - 逐段注解：把代码按逻辑段切开，每段一句话注解
@@ -771,12 +787,12 @@ Step 2 — 注解每个函数时，必须包含：
     * 设计意图：解释"为什么这样写"（如双重注册、预分配、幂等检查）
     * 关联点：标注和前序/后续函数的数据流关系
 
-Step 3 — 状态字典要专门建一览表：
+Step 4 — 状态字典要专门建一览表：
   - 在文档开头（阅读路线图后）列出 self.XXX = {} 的所有字段
   - 每个字段：类型 + 一句话用途
   - 这是"状态地图"，后续注解都对照它解释状态变迁
 
-Step 4 — 关联与边界：
+Step 5 — 关联与边界：
   - 每个函数注解末尾标注"被谁调用 / 调用谁"（如能从代码看出）
   - 标注和前序会话/关联文件的衔接点（如"这是 cache 数据 → Proxy 实例的接合点"）
 
@@ -793,6 +809,43 @@ Step 4 — 关联与边界：
 - **核心数据流**：输入什么 → 内部怎么转换 → 输出什么（如"业务传入 ActorDatas → 异步加载 Class + 五段式生命周期构造 → 写入 FastArray 网络复制到客户端"）
 - **边界**：与上下游/兄弟模块的职责切分（如适用，如"与 GS 侧 ROManager 命名对齐但实现独立，通过 SpawnRO/UnloadRO RPC 通信"）
 - **不涉及"本次注解读了什么"**——那是元信息块和未覆盖范围的事，职能总结只讲模块本身>
+
+## 核心时序图
+
+<基于 Phase B 实际精读到的调用关系，用 mermaid sequenceDiagram 画出模块核心数据流。
+**必须基于实际代码**，每条消息标注 file:line，读不到的调用关系不画。>
+
+### 主时序图：<主流程名>
+
+<一张图讲清主干：模块主入口 → 核心数据流 → 输出。参与者 ≤5 个，超出的子系统抽到子图。>
+
+\`\`\`mermaid
+sequenceDiagram
+    autonumber
+    participant 业务 as 业务调用方
+    participant MAC as MutableActorComponent
+    participant Sender as RequestSender
+    participant WP as WorldProxyMailbox
+    participant 对端 as 远端 DS
+
+    业务->>MAC: SendMutableActorMessage(ActorIDList, Name, Params) (Server:1096)
+    MAC->>MAC: _BuildPerChannelRequestTable 分桶 (Server:706)
+    MAC->>Sender: SendRequest(ChannelID, Request) (Server:730)
+    Note over MAC,Sender: ProcessMessageSender 每帧驱动 (Server:1454)
+    MAC->>MAC: ProcessFastForwarding 决策 (Server:1474)
+    alt 本进程目标
+        MAC->>对端: InnerSendFastForwardingRequestToActor 直发 (Server:1807)
+    else 跨 DS
+        MAC->>WP: SendMutableActorRequest (Server:1934)
+        WP-->>MAC: OnRemoteForwardingResponse (Server:1939)
+    end
+\`\`\`
+
+### <子系统名> 子时序图（按需，判据：>5 参与者 或 跨进程）
+
+<若主图参与者 >5 或含跨进程子系统，抽离为独立子图。每张子图聚焦一个高内聚子系统，
+如 "RO Spawn 流程"、"GS↔DS RO 数据上行"、"EntityCallback 跨端转发" 等。
+跨进程用 box 分区。若模块简单（主图 ≤5 参与者、无跨进程），本小节省略。>
 
 > 注解对象：<file_path>（<N> 行）
 > 注解风格：按四层结构逐函数贴原始代码 + 行号 + 逐段注解
@@ -893,6 +946,8 @@ subagent 产出后，主对话把文档写入 `code-reads/<module-slug>/<module-
 3. 运行时驱动：<N 个函数> 贴代码+注解
 4. 按需深入：<N 簇> 函数索引
 
+**核心时序图**：<N> 张（主图 + <M> 子图，子图判据：>5 参与者或跨进程）
+
 **状态字典**：列出 <N> 个 self.XXX 字段
 
 **未覆盖范围**：<列出第四层未展开的簇 / 关联文件未注解 / C++DS 侧未读等 1-2 项>
@@ -913,6 +968,7 @@ subagent 产出后，主对话把文档写入 `code-reads/<module-slug>/<module-
 5. **附录必出"常见问题速查表"**——把高频疑问固化下来，方便后续查阅
 6. **未覆盖范围必列**——诚实声明哪些层/簇未逐行注解
 7. **开头必出"模块职能总结"**——5-8 句话讲模块定位/载体/主入口/核心数据流/边界，放在标题下、注解对象元信息块上方。**必须基于 Phase B 实际读到的代码**，每个论断可追溯 file:line；读不到的不写，不编造。只讲模块本身，不涉及"本次注解读了什么"
+8. **核心时序图必出**——紧跟模块职能总结后，用 mermaid sequenceDiagram 画主流程时序。**必须基于 Phase B 实际精读到的代码**，每条消息标注 file:line；读不到的调用关系不画。主图参与者 >5 或含跨进程子系统（DS↔GS / Client↔DS）时，抽离为独立子图；模块简单（≤5 参与者、无跨进程）时可只画主图。时序图是时序视角，与阅读路线图的拓扑视角互补，两者都保留
 
 ---
 
